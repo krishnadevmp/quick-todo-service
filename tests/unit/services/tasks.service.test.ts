@@ -251,19 +251,27 @@ describe('tasksService.completeTask', () => {
     await expect(tasksService.completeTask(USER, 'nope')).rejects.toMatchObject({ status: 404 });
   });
 
-  it('is idempotent: completing an already-done task spawns nothing and re-saves nothing', async () => {
+  it('is idempotent: completing an already-done task spawns nothing and writes nothing', async () => {
     prismaMock.task.findFirst.mockResolvedValue(fakeTaskRow({ status: 'done' }));
 
     const result = await tasksService.completeTask(USER, 'task-1');
 
     expect(result.nextTask).toBeUndefined();
-    expect(prismaMock.task.update).not.toHaveBeenCalled();
+    expect(prismaMock.task.updateMany).not.toHaveBeenCalled();
     expect(prismaMock.task.create).not.toHaveBeenCalled();
   });
 
-  it('marks a non-recurring task done without spawning a next occurrence', async () => {
-    prismaMock.task.findFirst.mockResolvedValue(fakeTaskRow({ recurring: 'none' }));
-    prismaMock.task.update.mockResolvedValue(fakeTaskRow({ status: 'done', completedAt: NOW }));
+  it('uses a conditional updateMany (not an interactive transaction) for the idempotency guard, and reports a lost race as already-done', async () => {
+    // First read sees it as pending, but the write loses a race with another
+    // completion in between — updateMany's WHERE (status != 'done') matches
+    // nothing, so count is 0. This is the pooler-safe replacement for what
+    // used to be a Prisma interactive transaction — see the comment on
+    // completeTask for why interactive transactions don't work against
+    // Supabase's transaction-mode pooler.
+    prismaMock.task.findFirst
+      .mockResolvedValueOnce(fakeTaskRow({ status: 'todo' })) // initial read
+      .mockResolvedValueOnce(fakeTaskRow({ status: 'done', completedAt: NOW })); // refetch after losing the race
+    prismaMock.task.updateMany.mockResolvedValue({ count: 0 });
 
     const result = await tasksService.completeTask(USER, 'task-1');
 
@@ -272,14 +280,34 @@ describe('tasksService.completeTask', () => {
     expect(prismaMock.task.create).not.toHaveBeenCalled();
   });
 
+  it('marks a non-recurring task done without spawning a next occurrence', async () => {
+    prismaMock.task.findFirst
+      .mockResolvedValueOnce(fakeTaskRow({ recurring: 'none', status: 'todo' }))
+      .mockResolvedValueOnce(fakeTaskRow({ recurring: 'none', status: 'done', completedAt: NOW }));
+    prismaMock.task.updateMany.mockResolvedValue({ count: 1 });
+
+    const result = await tasksService.completeTask(USER, 'task-1');
+
+    expect(result.task.status).toBe('done');
+    expect(result.nextTask).toBeUndefined();
+    expect(prismaMock.task.create).not.toHaveBeenCalled();
+
+    const updateManyArgs = prismaMock.task.updateMany.mock.calls[0][0];
+    expect(updateManyArgs.where).toEqual({ id: 'task-1', status: { not: 'done' } });
+    expect(updateManyArgs.data.status).toBe('done');
+  });
+
   it('spawns the next occurrence for a recurring task, carrying over tags and computing the next due date', async () => {
     const original = fakeTaskRow({
       recurring: 'daily',
+      status: 'todo',
       dueDate: new Date('2026-08-16T00:00:00.000Z'),
       taskTags: [tagRelation('routine')],
     });
-    prismaMock.task.findFirst.mockResolvedValue(original);
-    prismaMock.task.update.mockResolvedValue({ ...original, status: 'done', completedAt: NOW });
+    prismaMock.task.findFirst
+      .mockResolvedValueOnce(original)
+      .mockResolvedValueOnce({ ...original, status: 'done', completedAt: NOW });
+    prismaMock.task.updateMany.mockResolvedValue({ count: 1 });
     prismaMock.task.create.mockResolvedValue(
       fakeTaskRow({ id: 'task-2', dueDate: new Date('2026-08-17T00:00:00.000Z'), recurringParentId: 'task-1' })
     );
@@ -298,11 +326,14 @@ describe('tasksService.completeTask', () => {
     const secondInSeries = fakeTaskRow({
       id: 'task-2',
       recurring: 'daily',
+      status: 'todo',
       recurringParentId: 'task-1', // task-1 is the original series root
       dueDate: new Date('2026-08-17T00:00:00.000Z'),
     });
-    prismaMock.task.findFirst.mockResolvedValue(secondInSeries);
-    prismaMock.task.update.mockResolvedValue({ ...secondInSeries, status: 'done' });
+    prismaMock.task.findFirst
+      .mockResolvedValueOnce(secondInSeries)
+      .mockResolvedValueOnce({ ...secondInSeries, status: 'done' });
+    prismaMock.task.updateMany.mockResolvedValue({ count: 1 });
     prismaMock.task.create.mockResolvedValue(fakeTaskRow({ id: 'task-3' }));
 
     await tasksService.completeTask(USER, 'task-2');
@@ -332,28 +363,23 @@ describe('tasksService.deleteTask', () => {
 // ── stopRecurring ────────────────────────────────────────────────────────
 
 describe('tasksService.stopRecurring', () => {
-  it('sets recurring=none on the task itself unconditionally', async () => {
-    prismaMock.task.findFirst.mockResolvedValue(fakeTaskRow({ recurring: 'daily' }));
-    prismaMock.task.updateMany.mockResolvedValue({ count: 0 });
-
-    await tasksService.stopRecurring(USER, 'task-1');
-
-    expect(prismaMock.task.update).toHaveBeenCalledWith({ where: { id: 'task-1' }, data: { recurring: 'none' } });
-  });
-
-  it('only propagates to pending (non-done) siblings in the same series', async () => {
+  it('updates the task and its pending siblings in a single round trip', async () => {
     prismaMock.task.findFirst.mockResolvedValue(fakeTaskRow({ id: 'task-1', recurring: 'daily', recurringParentId: null }));
-    prismaMock.task.updateMany.mockResolvedValue({ count: 2 });
+    prismaMock.task.updateMany.mockResolvedValue({ count: 3 });
 
     await tasksService.stopRecurring(USER, 'task-1');
+
+    expect(prismaMock.task.updateMany).toHaveBeenCalledTimes(1); // no separate per-row update call
+    expect(prismaMock.task.update).not.toHaveBeenCalled();
 
     const args = prismaMock.task.updateMany.mock.calls[0][0];
     expect(args.where).toEqual({
       userId: USER,
       deletedAt: null,
-      recurringParentId: 'task-1', // task-1 is its own series root
-      id: { not: 'task-1' },
-      status: { not: 'done' },
+      OR: [
+        { id: 'task-1' }, // self, unconditionally (regardless of its own status)
+        { recurringParentId: 'task-1', id: { not: 'task-1' }, status: { not: 'done' } }, // pending siblings only
+      ],
     });
     expect(args.data).toEqual({ recurring: 'none' });
   });
@@ -362,40 +388,54 @@ describe('tasksService.stopRecurring', () => {
 // ── updateSeries ─────────────────────────────────────────────────────────
 
 describe('tasksService.updateSeries', () => {
-  it('applies the change to the task and every pending sibling, but not done ones', async () => {
+  it('patches scalar fields for the task + pending siblings in one round trip when tags are unchanged', async () => {
     prismaMock.task.findFirst.mockResolvedValue(fakeTaskRow({ id: 'task-1', recurringParentId: null }));
-    prismaMock.task.findMany.mockResolvedValue([{ id: 'task-2' }, { id: 'task-3' }]);
-    prismaMock.task.update.mockResolvedValue(fakeTaskRow());
+    prismaMock.task.updateMany.mockResolvedValue({ count: 3 });
 
     await tasksService.updateSeries(USER, 'task-1', { priority: 'high' });
 
-    const siblingQuery = prismaMock.task.findMany.mock.calls[0][0];
-    expect(siblingQuery.where).toEqual({
+    expect(prismaMock.task.updateMany).toHaveBeenCalledTimes(1);
+    expect(prismaMock.task.findMany).not.toHaveBeenCalled(); // no need to look up sibling ids individually
+    expect(prismaMock.task.update).not.toHaveBeenCalled(); // no per-row writes needed
+
+    const args = prismaMock.task.updateMany.mock.calls[0][0];
+    expect(args.where).toEqual({
       userId: USER,
       deletedAt: null,
-      recurringParentId: 'task-1',
-      id: { not: 'task-1' },
-      status: { not: 'done' },
+      OR: [{ id: 'task-1' }, { recurringParentId: 'task-1', id: { not: 'task-1' }, status: { not: 'done' } }],
     });
-
-    // Once for the task itself, once per sibling.
-    expect(prismaMock.task.update).toHaveBeenCalledTimes(3);
-    for (const call of prismaMock.task.update.mock.calls) {
-      expect(call[0].data.priority).toBe('high');
-    }
+    expect(args.data.priority).toBe('high');
   });
 
   it('excludes dueDate/status/completedAt from what it can change (not accepted by the schema layer, but verify the service never writes them)', async () => {
     prismaMock.task.findFirst.mockResolvedValue(fakeTaskRow({ id: 'task-1' }));
-    prismaMock.task.findMany.mockResolvedValue([]);
-    prismaMock.task.update.mockResolvedValue(fakeTaskRow());
+    prismaMock.task.updateMany.mockResolvedValue({ count: 1 });
 
     await tasksService.updateSeries(USER, 'task-1', { priority: 'low' });
 
-    const args = prismaMock.task.update.mock.calls[0][0];
+    const args = prismaMock.task.updateMany.mock.calls[0][0];
     expect(args.data).not.toHaveProperty('dueDate');
     expect(args.data).not.toHaveProperty('status');
     expect(args.data).not.toHaveProperty('completedAt');
+  });
+
+  it('only touches tag relations per-row (and only fetches targets) when tags actually change', async () => {
+    prismaMock.task.findFirst.mockResolvedValue(fakeTaskRow({ id: 'task-1', recurringParentId: null }));
+    prismaMock.task.updateMany.mockResolvedValue({ count: 2 });
+    prismaMock.task.findMany.mockResolvedValue([{ id: 'task-1' }, { id: 'task-2' }]);
+    prismaMock.tag.upsert.mockResolvedValue({ id: 'tag-new' });
+    prismaMock.task.update.mockResolvedValue(fakeTaskRow());
+
+    await tasksService.updateSeries(USER, 'task-1', { tags: ['new'] });
+
+    // Scalar patch still happens in one round trip...
+    expect(prismaMock.task.updateMany).toHaveBeenCalledTimes(1);
+    // ...but relation writes need a row each — once per target found.
+    expect(prismaMock.task.findMany).toHaveBeenCalledTimes(1);
+    expect(prismaMock.task.update).toHaveBeenCalledTimes(2);
+    for (const call of prismaMock.task.update.mock.calls) {
+      expect(call[0].data).toEqual({ taskTags: { deleteMany: {}, create: [{ tagId: 'tag-new' }] } });
+    }
   });
 });
 

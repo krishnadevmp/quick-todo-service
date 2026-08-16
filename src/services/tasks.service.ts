@@ -36,19 +36,24 @@ function toDto(t: TaskWithTags) {
   };
 }
 
-/** Find-or-create each tag name for this user; returns their ids. */
+/**
+ * Find-or-create each tag name for this user; returns their ids.
+ * Each upsert is independent (keyed on the userId+name unique constraint),
+ * so they run concurrently rather than one round trip per tag — matters a
+ * lot once the DB isn't on localhost (see docs on Supabase pooler latency).
+ */
 async function syncTags(userId: string, names: string[]): Promise<string[]> {
   const unique = [...new Set(names)];
-  const ids: string[] = [];
-  for (const name of unique) {
-    const tag = await prisma.tag.upsert({
-      where: { userId_name: { userId, name } },
-      update: {},
-      create: { userId, name },
-    });
-    ids.push(tag.id);
-  }
-  return ids;
+  const tags = await Promise.all(
+    unique.map((name) =>
+      prisma.tag.upsert({
+        where: { userId_name: { userId, name } },
+        update: {},
+        create: { userId, name },
+      })
+    )
+  );
+  return tags.map((tag) => tag.id);
 }
 
 async function assertOwned(userId: string, id: string) {
@@ -197,51 +202,67 @@ export async function updateTask(userId: string, id: string, patch: z.infer<type
 
 /**
  * Mark a task done. If it's part of a recurring series, spawns the next
- * occurrence in the same transaction — the DB-level equivalent of the
- * frontend's read-write Dexie transaction, same idempotency guard.
+ * occurrence.
+ *
+ * Deliberately NOT a Prisma interactive transaction (`$transaction(async
+ * (tx) => ...)`). Those require every query to run on the same underlying
+ * connection, which breaks against a transaction-mode connection pooler
+ * (e.g. Supabase's pooler on port 6543, `pgbouncer=true`) — the pooler can
+ * hand each statement to a different backend connection, and Prisma errors
+ * with P2028 "Transaction not found." Instead, the idempotency guard is an
+ * atomic conditional UPDATE (`status: { not: 'done' }` in the WHERE) — a
+ * single-statement compare-and-swap that's pooler-safe and, if anything, a
+ * stronger race guarantee than the read-then-write the transaction used to
+ * do.
  */
 export async function completeTask(userId: string, id: string) {
-  return prisma.$transaction(async (tx) => {
-    const task = await tx.task.findFirst({ where: { id, userId, deletedAt: null }, include: taskInclude });
-    if (!task) throw notFound('Task not found');
-    if (task.status === 'done') return { task: toDto(task), nextTask: undefined };
+  const task = await prisma.task.findFirst({ where: { id, userId, deletedAt: null }, include: taskInclude });
+  if (!task) throw notFound('Task not found');
+  if (task.status === 'done') return { task: toDto(task), nextTask: undefined };
 
-    const now = new Date();
-    const updated = await tx.task.update({
-      where: { id },
-      data: { status: 'done', completedAt: now },
-      include: taskInclude,
-    });
-
-    if (task.recurring === 'none') return { task: toDto(updated), nextTask: undefined };
-
-    const nextDueDate = getNextOccurrence(
-      task.dueDate ? dateToDateStr(task.dueDate) : undefined,
-      task.recurring as RecurringPattern
-    );
-    const parentId = task.recurringParentId ?? task.id;
-    const tagIds = task.taskTags.map((tt) => tt.tagId);
-
-    const nextRow = await tx.task.create({
-      data: {
-        userId,
-        title: task.title,
-        description: task.description,
-        priority: task.priority,
-        category: task.category,
-        status: 'todo',
-        dueDate: dateStrToDate(nextDueDate),
-        dueTime: task.dueTime,
-        reminderOffset: task.reminderOffset,
-        recurring: task.recurring,
-        recurringParentId: parentId,
-        taskTags: { create: tagIds.map((tagId) => ({ tagId })) },
-      },
-      include: taskInclude,
-    });
-
-    return { task: toDto(updated), nextTask: toDto(nextRow) };
+  const now = new Date();
+  const result = await prisma.task.updateMany({
+    where: { id, status: { not: 'done' } },
+    data: { status: 'done', completedAt: now },
   });
+
+  if (result.count === 0) {
+    // Lost a race with another completion between the read above and this
+    // write — report it as already-done rather than double-spawning.
+    const current = await prisma.task.findFirst({ where: { id }, include: taskInclude });
+    return { task: toDto(current ?? task), nextTask: undefined };
+  }
+
+  const updated = await prisma.task.findFirst({ where: { id }, include: taskInclude });
+
+  if (task.recurring === 'none') return { task: toDto(updated ?? task), nextTask: undefined };
+
+  const nextDueDate = getNextOccurrence(
+    task.dueDate ? dateToDateStr(task.dueDate) : undefined,
+    task.recurring as RecurringPattern
+  );
+  const parentId = task.recurringParentId ?? task.id;
+  const tagIds = task.taskTags.map((tt) => tt.tagId);
+
+  const nextRow = await prisma.task.create({
+    data: {
+      userId,
+      title: task.title,
+      description: task.description,
+      priority: task.priority,
+      category: task.category,
+      status: 'todo',
+      dueDate: dateStrToDate(nextDueDate),
+      dueTime: task.dueTime,
+      reminderOffset: task.reminderOffset,
+      recurring: task.recurring,
+      recurringParentId: parentId,
+      taskTags: { create: tagIds.map((tagId) => ({ tagId })) },
+    },
+    include: taskInclude,
+  });
+
+  return { task: toDto(updated ?? task), nextTask: toDto(nextRow) };
 }
 
 /** Soft delete — see docs/DATABASE_DESIGN.md on deletedAt. */
@@ -254,9 +275,13 @@ export async function stopRecurring(userId: string, id: string) {
   const task = await assertOwned(userId, id);
   const parentId = task.recurringParentId ?? task.id;
 
-  await prisma.task.update({ where: { id }, data: { recurring: 'none' } });
+  // Self (unconditionally) + pending siblings, in one round trip instead of two.
   await prisma.task.updateMany({
-    where: { userId, deletedAt: null, recurringParentId: parentId, id: { not: id }, status: { not: 'done' } },
+    where: {
+      userId,
+      deletedAt: null,
+      OR: [{ id }, { recurringParentId: parentId, id: { not: id }, status: { not: 'done' } }],
+    },
     data: { recurring: 'none' },
   });
 }
@@ -276,21 +301,30 @@ export async function updateSeries(userId: string, id: string, changes: z.infer<
     recurring: changes.recurring,
   };
 
-  await prisma.task.update({
-    where: { id },
-    data: { ...baseData, ...(tagIds && { taskTags: { deleteMany: {}, create: tagIds.map((tagId) => ({ tagId })) } }) },
-  });
+  // Self (unconditionally) + pending siblings — same "the whole series" set
+  // stopRecurring uses.
+  const seriesWhere: Prisma.TaskWhereInput = {
+    userId,
+    deletedAt: null,
+    OR: [{ id }, { recurringParentId: parentId, id: { not: id }, status: { not: 'done' } }],
+  };
 
-  const siblings = await prisma.task.findMany({
-    where: { userId, deletedAt: null, recurringParentId: parentId, id: { not: id }, status: { not: 'done' } },
-    select: { id: true },
-  });
+  // Scalar fields patch the whole series in a single round trip.
+  await prisma.task.updateMany({ where: seriesWhere, data: baseData });
 
-  for (const sibling of siblings) {
-    await prisma.task.update({
-      where: { id: sibling.id },
-      data: { ...baseData, ...(tagIds && { taskTags: { deleteMany: {}, create: tagIds.map((tagId) => ({ tagId })) } }) },
-    });
+  // Tag relations can't be set via updateMany (no relation writes there), so
+  // only pay for per-row round trips when tags actually changed — and run
+  // them concurrently rather than sequentially.
+  if (tagIds) {
+    const targets = await prisma.task.findMany({ where: seriesWhere, select: { id: true } });
+    await Promise.all(
+      targets.map((t) =>
+        prisma.task.update({
+          where: { id: t.id },
+          data: { taskTags: { deleteMany: {}, create: tagIds.map((tagId) => ({ tagId })) } },
+        })
+      )
+    );
   }
 }
 
