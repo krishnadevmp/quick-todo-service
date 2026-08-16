@@ -1,0 +1,172 @@
+// Quick Todo — Prisma schema (PostgreSQL)
+//
+// Implements the design in ../docs/DATABASE_DESIGN.md with one deliberate
+// deviation from ../db/schema.sql: closed-value fields (priority, status,
+// category, reminderOffset, recurring, currency, theme, expense category)
+// are plain `String` columns instead of native Postgres ENUMs.
+//
+// Why: several of these values are not valid Prisma enum identifiers as-is
+// ('in-progress', '15', '30', '60', '1440') and would need a @map alias,
+// which makes Prisma Client return the *alias name* (e.g. "inProgress"),
+// not the literal string the frontend's TS types use ("in-progress"). That
+// mismatch would need a translation layer on every response. Plain strings,
+// validated by the Zod schemas in src/schemas/ (mirroring the frontend's
+// src/types/index.ts union types exactly), keep the API's JSON identical to
+// what the frontend already expects — zero translation, one source of truth.
+// db/schema.sql remains the conceptual/ERD reference; this file is what's
+// actually migrated.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── users ────────────────────────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  name         String
+  // Normalized to lowercase at the app layer (src/lib/hash.ts / auth.service)
+  // before every read/write, so uniqueness is effectively case-insensitive
+  // without needing the citext extension.
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  settings UserSettings?
+  tasks    Task[]
+  tags     Tag[]
+  expenses Expense[]
+
+  @@map("users")
+}
+
+// ── user_settings (1:1 with users) ─────────────────────────────────────────
+// Mirrors AppSettings from src/types/index.ts. notificationPermission is
+// browser-runtime-only in the frontend and has no column here either.
+
+model UserSettings {
+  userId                String   @id @map("user_id") @db.Uuid
+  user                  User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  theme                 String   @default("dark") // 'dark' | 'light' | 'system'
+  notificationsEnabled  Boolean  @default(false) @map("notifications_enabled")
+  defaultReminderOffset String   @default("30") @map("default_reminder_offset")
+  defaultPriority       String   @default("none") @map("default_priority")
+  showCompleted         Boolean  @default(true) @map("show_completed")
+  currency              String   @default("AED")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  @@map("user_settings")
+}
+
+// ── tags (normalized, per-user namespace) ──────────────────────────────────
+
+model Tag {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // Lowercase, no '#' prefix — matches the frontend's #tag shortcut parsing.
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  taskTags TaskTag[]
+
+  @@unique([userId, name])
+  @@index([userId])
+  @@map("tags")
+}
+
+// ── tasks ────────────────────────────────────────────────────────────────
+
+model Task {
+  id     String @id @default(uuid()) @db.Uuid
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  title       String
+  description String?
+
+  priority String  @default("none") // 'high' | 'medium' | 'low' | 'none'
+  category String? //                 'work' | 'personal' | 'project' | 'routine'
+  status   String  @default("todo") // 'todo' | 'in-progress' | 'done'
+
+  dueDate DateTime? @map("due_date") @db.Date
+  // Stored as "HH:MM" text (not a native `time`) so it round-trips through
+  // the API exactly like the frontend's dueTime string — no TZ/date-part
+  // artifacts from Postgres's `time` type to strip back out.
+  dueTime String?   @map("due_time")
+
+  reminderOffset String @default("none") @map("reminder_offset") // see ReminderOffset union
+  recurring      String @default("none") // 'none' | 'daily' | 'weekdays' | 'weekly' | 'monthly'
+
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  completedAt DateTime? @map("completed_at")
+
+  // Soft delete: the app updates this instead of hard-deleting so a future
+  // Dexie<->server sync can distinguish "deleted" from "never existed".
+  deletedAt DateTime? @map("deleted_at")
+
+  // Self-reference: the recurring template a generated instance came from.
+  // Deleting the template orphans instances (SET NULL) rather than
+  // cascade-deleting task history.
+  recurringParentId String? @map("recurring_parent_id") @db.Uuid
+  recurringParent   Task?   @relation("RecurringSeries", fields: [recurringParentId], references: [id], onDelete: SetNull)
+  recurringChildren Task[]  @relation("RecurringSeries")
+
+  taskTags TaskTag[]
+
+  @@index([userId])
+  @@index([userId, status])
+  @@index([userId, priority])
+  @@index([userId, category])
+  @@index([userId, dueDate])
+  @@index([userId, createdAt])
+  @@index([recurringParentId])
+  @@map("tasks")
+}
+
+// task_tags: many-to-many join between tasks and tags.
+model TaskTag {
+  taskId String @map("task_id") @db.Uuid
+  tagId  String @map("tag_id") @db.Uuid
+  task   Task   @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  tag    Tag    @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([taskId, tagId])
+  @@index([tagId])
+  @@map("task_tags")
+}
+
+// ── expenses ────────────────────────────────────────────────────────────
+
+model Expense {
+  id     String @id @default(uuid()) @db.Uuid
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  title       String
+  description String?
+  amount      Decimal @db.Decimal(12, 2) // exact decimal, no float rounding on money
+
+  category       String // see ExpenseCategory union
+  customCategory String? @map("custom_category") // only set when category = 'other'
+
+  date DateTime @db.Date
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([userId])
+  @@index([userId, category])
+  @@index([userId, date])
+  @@index([userId, createdAt])
+  @@map("expenses")
+}

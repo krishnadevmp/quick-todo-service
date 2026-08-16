@@ -1,0 +1,18 @@
+# Convenience: a local Postgres instance matching .env.example's DATABASE_URL.
+# Not required if you already have a Postgres instance (e.g. Supabase) —
+# just point DATABASE_URL at that instead and skip this file entirely.
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: quicktodo
+      POSTGRES_PASSWORD: quicktodo
+      POSTGRES_DB: quicktodo
+    ports:
+      - "5432:5432"
+    volumes:
+      - quicktodo-db-data:/var/lib/postgresql/data
+
+volumes:
+  quicktodo-db-data:
